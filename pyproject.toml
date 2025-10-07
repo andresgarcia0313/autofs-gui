@@ -1,0 +1,9 @@
+[project]
+name = "autofs-gui"
+version = "0.1.0"
+description = "A GUI and CLI for managing autofs SSHFS mounts."
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
