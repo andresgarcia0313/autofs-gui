@@ -93,6 +93,56 @@ class UseCases:
         cmd = self.ssh_test_cmd(entry, check_path=check_path, timeout_sec=timeout_sec)
         return self.runner.run(cmd, max(timeout_sec + 10, 20))
 
+    def check_mount(self, path: str, timeout: int = 10) -> Tuple[int, str, str]:
+        return self.runner.run(f"mountpoint {shlex_quote(path)}", timeout)
+
+    def ensure_root_access(self, entry: Dict[str, Any]) -> Optional[str]:
+        host = (entry.get("host") or "").strip()
+        remote_user = (entry.get("user") or "").strip()
+        user_identity = (entry.get("identity_file") or "").strip()
+        if not host or not remote_user or not user_identity:
+            return None
+
+        root_identity = "/root/.ssh/id_ed25519"
+        setup_cmds = [
+            "install -d -m 700 /root/.ssh",
+            "touch /root/.ssh/known_hosts",
+            "chmod 600 /root/.ssh/known_hosts",
+            "test -f /root/.ssh/id_ed25519 || ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519",
+        ]
+        for cmd in setup_cmds:
+            rc, out, err = run_sudo(cmd, timeout=20, ask_pass=self.ask_pass)
+            if rc != 0:
+                raise RuntimeError(err or out or f"Fallo ejecutando: {cmd}")
+
+        rc, pub, err = run_sudo("cat /root/.ssh/id_ed25519.pub", timeout=10, ask_pass=self.ask_pass)
+        if rc != 0 or not (pub := (pub or "").strip()):
+            raise RuntimeError(err or "No se pudo leer la clave pública de root.")
+
+        escaped_pub = pub.replace("'", "'\"'\"'")
+        remote = f"{remote_user}@{host}"
+        remote_cmd = (
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
+            "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && "
+            f"(grep -qxF '{escaped_pub}' ~/.ssh/authorized_keys || echo '{escaped_pub}' >> ~/.ssh/authorized_keys)"
+        )
+        ssh_cmd = (
+            f"ssh -o StrictHostKeyChecking=accept-new "
+            f"-i {shlex_quote(user_identity)} {shlex_quote(remote)} {shlex_quote(remote_cmd)}"
+        )
+        rc, out, err = self.runner.run(ssh_cmd, timeout=30)
+        if rc != 0:
+            raise RuntimeError(err or out or "No se pudo registrar la clave de root en el servidor remoto.")
+
+        return root_identity
+
+    def trigger_mount(self, path: str, timeout: int = 20) -> Tuple[int, str, str]:
+        return run_sudo(f"ls -la {shlex_quote(path)}", timeout=timeout, ask_pass=self.ask_pass)
+
+    def collect_autofs_log(self, lines: int = 40) -> Tuple[int, str, str]:
+        cmd = f"journalctl -u autofs -n {lines} --no-pager"
+        return run_sudo(cmd, timeout=20, ask_pass=self.ask_pass)
+
     def write_config(self, master_body: str, map_body: str, as_root: bool) -> Dict[str, Any]:
         if as_root:
             self.files.write_atomic(self.paths.MASTER_D_PATH, master_body)

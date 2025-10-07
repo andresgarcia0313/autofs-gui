@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from typing import Iterable, Dict, Any
 
 
@@ -41,6 +42,15 @@ def build_map_line(entry: Dict[str, Any]) -> str:
     opts = [f"-fstype={fstype}"]
     if identity_file:
         opts.append(f"IdentityFile={identity_file}")
+        if identity_file.startswith("/root/"):
+            known_hosts = "/root/.ssh/known_hosts"
+        else:
+            ssh_dir = os.path.dirname(identity_file)
+            known_hosts_candidate = os.path.join(ssh_dir, "known_hosts")
+            known_hosts = known_hosts_candidate if os.path.exists(known_hosts_candidate) else None
+        if known_hosts:
+            opts.append(f"UserKnownHostsFile={known_hosts}")
+        opts.append("StrictHostKeyChecking=accept-new")
     if allow_other:
         opts.append("allow_other")
     if uid:
@@ -76,4 +86,3 @@ def build_map_file(entries: Iterable[Dict[str, Any]]) -> str:
     )
     lines = [build_map_line(e) for e in entries]
     return header + "\n".join(lines) + ("\n" if lines else "")
-

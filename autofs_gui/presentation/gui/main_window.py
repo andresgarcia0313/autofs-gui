@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
-import difflib
+import os
 from datetime import datetime
+import threading
 from typing import List, Optional, Tuple
+from shlex import quote as shlex_quote
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
@@ -27,6 +29,8 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QDialogButtonBox,
     QFileDialog,
+    QApplication,
+    QComboBox,
 )
 
 from autofs_gui.application.factory import make_usecases
@@ -34,6 +38,7 @@ from autofs_gui.domain.models import AppState, SshfsEntry
 from autofs_gui.domain.validation import validate_entry
 from autofs_gui.infrastructure.repositories import load_state, save_state, APP_CONFIG_FILE
 from autofs_gui.infrastructure.system import is_root
+from autofs_gui.infrastructure.discovery import discover_hosts, HostCandidate
 
 
 class MainWindow(QMainWindow):
@@ -45,14 +50,20 @@ class MainWindow(QMainWindow):
         self.app_state, initial_message = self._load_initial_state()
         self._dirty = False
         self._last_status_state: Optional[str] = None
+        self._apply_timer: Optional[QTimer] = None
+        self._pending_apply_reason: Optional[str] = None
+        self._is_applying = False
 
         self._build_ui()
         self._restore_ui_state()
         self._apply_master_options()
         self._refresh_entries_table()
         self._mark_dirty(False)
-        self._append_output(initial_message)
+        if initial_message:
+            self._append_output(initial_message)
+        self._warm_host_cache()
         self._start_status_monitor()
+        self._load_from_system(initial=True)
 
     # ------------------------------------------------------------------ UI setup
     def _build_ui(self) -> None:
@@ -67,7 +78,7 @@ class MainWindow(QMainWindow):
 
         left_col = QVBoxLayout()
         left_col.setSpacing(10)
-        content_layout.addLayout(left_col, stretch=3)
+        content_layout.addLayout(left_col, stretch=1)
 
         master_box = QGroupBox("Opciones master", central)
         master_layout = QHBoxLayout(master_box)
@@ -166,59 +177,30 @@ class MainWindow(QMainWindow):
 
         detail_box = QGroupBox("Detalle de la entrada seleccionada", central)
         detail_layout = QVBoxLayout(detail_box)
+        detail_actions = QHBoxLayout()
+        detail_actions.addStretch()
+        self.btn_copy_detail = QPushButton("Copiar detalle")
+        self.btn_copy_detail.setToolTip("Copia el detalle JSON de la entrada seleccionada al portapapeles.")
+        self.btn_copy_detail.clicked.connect(self._copy_entry_detail)
+        detail_actions.addWidget(self.btn_copy_detail)
+        detail_layout.addLayout(detail_actions)
         self.entry_detail = QPlainTextEdit(detail_box)
         self.entry_detail.setReadOnly(True)
         self.entry_detail.setMinimumHeight(120)
         detail_layout.addWidget(self.entry_detail)
         left_col.addWidget(detail_box)
 
-        right_col = QVBoxLayout()
-        right_col.setSpacing(10)
-        content_layout.addLayout(right_col, stretch=1)
-
-        actions_box = QGroupBox("Acciones", central)
-        actions_layout = QVBoxLayout(actions_box)
-        actions_layout.setContentsMargins(10, 8, 10, 8)
-        actions_layout.setSpacing(6)
-
-        self.btn_load_system = QPushButton("Cargar /etc")
-        self.btn_load_system.clicked.connect(self._load_from_system)
-        self.btn_load_system.setToolTip("Importa la configuración actualmente instalada en el sistema (/etc).")
-        actions_layout.addWidget(self.btn_load_system)
-
-        self.btn_reload_state = QPushButton("Recargar estado")
-        self.btn_reload_state.clicked.connect(self._reload_state)
-        self.btn_reload_state.setToolTip("Recupera el estado guardado previamente para este usuario.")
-        actions_layout.addWidget(self.btn_reload_state)
-
-        self.btn_save_state = QPushButton("Guardar estado")
-        self.btn_save_state.clicked.connect(self._save_state)
-        self.btn_save_state.setToolTip("Guarda las entradas y ajustes actuales en el perfil del usuario.")
-        actions_layout.addWidget(self.btn_save_state)
-
-        self.btn_build_preview = QPushButton("Vista previa archivos")
-        self.btn_build_preview.clicked.connect(self._build_preview)
-        self.btn_build_preview.setToolTip("Genera los archivos master y map para revisarlos antes de instalarlos.")
-        actions_layout.addWidget(self.btn_build_preview)
-
-        self.btn_write_config = QPushButton("Escribir configuración")
-        self.btn_write_config.clicked.connect(self._write_config)
-        self.btn_write_config.setToolTip("Escribe los archivos generados en el sistema. Requiere permisos adecuados.")
-        actions_layout.addWidget(self.btn_write_config)
-
-        self.btn_enable_allow_other = QPushButton("Habilitar user_allow_other")
-        self.btn_enable_allow_other.clicked.connect(self._enable_user_allow_other)
-        self.btn_enable_allow_other.setToolTip("Activa la opción user_allow_other en /etc/fuse.conf para permitir uso compartido.")
-        actions_layout.addWidget(self.btn_enable_allow_other)
-
-        actions_layout.addStretch()
-        right_col.addWidget(actions_box)
-        right_col.addStretch()
-
         logs_box = QGroupBox("Registros", central)
         logs_layout = QVBoxLayout(logs_box)
         logs_layout.setContentsMargins(10, 8, 10, 8)
         logs_layout.setSpacing(4)
+        logs_actions = QHBoxLayout()
+        logs_actions.addStretch()
+        self.btn_copy_logs = QPushButton("Copiar registros")
+        self.btn_copy_logs.setToolTip("Copia el contenido actual de los registros al portapapeles.")
+        self.btn_copy_logs.clicked.connect(self._copy_logs)
+        logs_actions.addWidget(self.btn_copy_logs)
+        logs_layout.addLayout(logs_actions)
         self.output_text = QPlainTextEdit(logs_box)
         self.output_text.setReadOnly(True)
         self.output_text.setMinimumHeight(200)
@@ -240,6 +222,17 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 return AppState(), f"No se pudo cargar el estado guardado ({exc})."
         return AppState(), "Sin estado previo. Puedes cargar desde /etc o agregar entradas nuevas."
+
+    def _warm_host_cache(self) -> None:
+        def worker():
+            try:
+                discover_hosts(force=False)
+                QTimer.singleShot(0, lambda: None)  # trigger UI loop
+            except Exception as exc:
+                QTimer.singleShot(0, lambda e=exc: self._append_output(
+                    f"No se pudo precargar el listado de hosts: {e}", level="warning"
+                ))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _apply_master_options(self) -> None:
         self.timeout_spin.blockSignals(True)
@@ -285,7 +278,20 @@ class MainWindow(QMainWindow):
         return selected[0].row()
 
     def _entries_dicts(self) -> List[dict]:
-        return [entry.to_dict() for entry in self.app_state.entries]
+        prepared = []
+        for entry in self.app_state.entries:
+            data = entry.to_dict()
+            try:
+                new_identity = self.usecases.ensure_root_access(data)
+                if new_identity:
+                    data["identity_file"] = new_identity
+            except Exception as exc:
+                self._append_output(
+                    f"No se pudo preparar el acceso SSH para {data.get('host')}: {exc}",
+                    level="warning",
+                )
+            prepared.append(data)
+        return prepared
 
     # ---------------------------------------------------------------- event handlers
     def _indicator_style(self, color: str) -> str:
@@ -357,11 +363,11 @@ class MainWindow(QMainWindow):
 
     def _on_timeout_changed(self, value: int) -> None:
         self.app_state.master_options.timeout = int(value)
-        self._mark_dirty(True)
+        self._mark_dirty(True, "Timeout actualizado.")
 
     def _on_ghost_toggled(self, checked: bool) -> None:
         self.app_state.master_options.ghost = bool(checked)
-        self._mark_dirty(True)
+        self._mark_dirty(True, "Opción --ghost actualizada.")
 
     def _update_entry_detail(self) -> None:
         idx = self._current_entry_index()
@@ -396,7 +402,7 @@ class MainWindow(QMainWindow):
             if entry:
                 self.app_state.entries.append(entry)
                 self._refresh_entries_table()
-                self._mark_dirty(True)
+                self._mark_dirty(True, "Se agregó una entrada.")
 
     def _edit_entry(self) -> None:
         idx = self._current_entry_index()
@@ -410,7 +416,7 @@ class MainWindow(QMainWindow):
                 self.app_state.entries[idx] = entry
                 self._refresh_entries_table()
                 self.entries_table.selectRow(idx)
-                self._mark_dirty(True)
+                self._mark_dirty(True, "Se actualizó una entrada.")
 
     def _delete_entry(self) -> None:
         idx = self._current_entry_index()
@@ -427,7 +433,7 @@ class MainWindow(QMainWindow):
         if confirm == QMessageBox.StandardButton.Yes:
             del self.app_state.entries[idx]
             self._refresh_entries_table()
-            self._mark_dirty(True)
+            self._mark_dirty(True, "Se eliminó una entrada.")
 
     def _test_selected_entry(self) -> None:
         entry = self._selected_entry_or_warn("Probar conexión SSH")
@@ -495,97 +501,38 @@ class MainWindow(QMainWindow):
             self._append_output(f"{message} Detalle: {detail}", level="warning")
             QMessageBox.warning(self, "Desmontar", f"{message}\n\nDetalle:\n{detail}")
 
-    def _load_from_system(self) -> None:
+    def _load_from_system(self, initial: bool = False) -> None:
         try:
             entries, timeout, ghost = self.usecases.load_from_system()
         except Exception as exc:
             self._show_error(f"No se pudo cargar desde /etc: {exc}")
+            self._status("Error al cargar configuración desde /etc.", 6000)
             return
         self.app_state.entries = [SshfsEntry.from_dict(e) for e in entries]
         self.app_state.master_options.timeout = timeout
         self.app_state.master_options.ghost = ghost
         self._apply_master_options()
         self._refresh_entries_table()
-        self._mark_dirty(True)
-        self._append_output("Configuración cargada desde el sistema (/etc).")
-
-    def _reload_state(self) -> None:
-        state, message = self._load_initial_state()
-        self.app_state = state
-        self._apply_master_options()
-        self._refresh_entries_table()
         self._mark_dirty(False)
+        message = "Configuración cargada desde /etc." if initial else "Configuración actualizada desde /etc."
         self._append_output(message)
+        self._status(message, 6000)
+        try:
+            self._save_state(silent=True)
+        except Exception:
+            pass
 
-    def _save_state(self) -> None:
+    def _save_state(self, silent: bool = False) -> None:
         self._remember_ui_state()
         try:
             save_state(self.app_state.to_dict())
         except Exception as exc:
+            if silent:
+                raise
             self._show_error(f"No se pudo guardar el estado: {exc}")
             return
-        self._mark_dirty(False)
-        self._append_output(f"Estado guardado en {APP_CONFIG_FILE}")
-
-    def _build_preview(self) -> None:
-        try:
-            master_body, map_body = self.usecases.build_files(
-                self._entries_dicts(),
-                self.app_state.master_options.timeout,
-                self.app_state.master_options.ghost,
-            )
-            current_master, current_map = self.usecases.read_current_files()
-        except Exception as exc:
-            self._show_error(f"No se pudo construir la configuración: {exc}")
-            return
-        text = (
-            f"=== {self.usecases.paths.MASTER_D_PATH} ===\n"
-            f"{master_body}\n\n"
-            f"=== {self.usecases.paths.MAP_FILE_PATH} ===\n"
-            f"{map_body}"
-        )
-        diff_master = "\n".join(
-            difflib.unified_diff(
-                (current_master or "").splitlines(),
-                master_body.splitlines(),
-                fromfile="master actual",
-                tofile="master nuevo",
-                lineterm="",
-            )
-        )
-        diff_map = "\n".join(
-            difflib.unified_diff(
-                (current_map or "").splitlines(),
-                map_body.splitlines(),
-                fromfile="mapa actual",
-                tofile="mapa nuevo",
-                lineterm="",
-            )
-        )
-        if diff_master or diff_map:
-            text += "\n\n=== Diff master ===\n"
-            text += diff_master or "Sin cambios detectados."
-            text += "\n\n=== Diff mapa ===\n"
-            text += diff_map or "Sin cambios detectados."
-        else:
-            text += "\n\n(No se detectaron diferencias con los archivos actuales.)"
-        self._set_output(text)
-
-    def _write_config(self) -> None:
-        try:
-            master_body, map_body = self.usecases.build_files(
-                self._entries_dicts(),
-                self.app_state.master_options.timeout,
-                self.app_state.master_options.ghost,
-            )
-            result = self.usecases.write_config(master_body, map_body, as_root=is_root())
-        except Exception as exc:
-            self._show_error(f"No se pudo escribir la configuración: {exc}")
-            return
-        message = result.get("message", "Operación completada.")
-        level = "success" if not result.get("temporary") else "warning"
-        self._append_output(message, level=level)
-        QMessageBox.information(self, "Escritura de configuración", message)
+        if not silent:
+            self._append_output(f"Estado guardado en {APP_CONFIG_FILE}")
 
     def _service_action(self, action: str) -> None:
         titles = {
@@ -620,21 +567,8 @@ class MainWindow(QMainWindow):
 
         self._check_service_status()
 
-    def _enable_user_allow_other(self) -> None:
-        try:
-            self.usecases.enable_user_allow_other(self.usecases.paths.FUSE_CONF)
-        except PermissionError as exc:
-            self._show_error(f"Permiso denegado al modificar fuse.conf: {exc}")
-            return
-        except Exception as exc:
-            self._show_error(f"No se pudo actualizar fuse.conf: {exc}")
-            return
-        msg = f"Se habilitó user_allow_other en {self.usecases.paths.FUSE_CONF}."
-        self._append_output(msg, level="success")
-        QMessageBox.information(self, "fuse.conf", msg)
-
     # ---------------------------------------------------------------- feedback helpers
-    def _mark_dirty(self, dirty: bool) -> None:
+    def _mark_dirty(self, dirty: bool, reason: Optional[str] = None) -> None:
         self._dirty = dirty
         title = "AutoFS GUI"
         if dirty:
@@ -645,12 +579,177 @@ class MainWindow(QMainWindow):
             self.dirty_label.setText("Sin cambios")
             self.dirty_label.setStyleSheet("")
         self.setWindowTitle(title)
+        if dirty and reason:
+            self._schedule_apply(reason)
 
     def _scroll_logs_to_end(self) -> None:
         if self.output_text:
             sb = self.output_text.verticalScrollBar()
             if sb:
                 sb.setValue(sb.maximum())
+
+    def _copy_entry_detail(self) -> None:
+        text = self.entry_detail.toPlainText().strip()
+        if not text:
+            self._status("No hay detalle para copiar.", 4000)
+            return
+        QApplication.clipboard().setText(text)
+        self._status("Detalle copiado al portapapeles.", 4000)
+
+    def _copy_logs(self) -> None:
+        text = self.output_text.toPlainText().strip()
+        if not text:
+            self._status("No hay registros para copiar.", 4000)
+            return
+        QApplication.clipboard().setText(text)
+        self._status("Registros copiados al portapapeles.", 4000)
+
+    def _schedule_apply(self, reason: str) -> None:
+        if self._is_applying:
+            return
+        self._pending_apply_reason = reason
+        if self._apply_timer is None:
+            self._apply_timer = QTimer(self)
+            self._apply_timer.setSingleShot(True)
+            self._apply_timer.timeout.connect(self._apply_changes)
+        self._apply_timer.start(400)
+
+    def _apply_changes(self) -> None:
+        if self._apply_timer:
+            self._apply_timer.stop()
+        reason = self._pending_apply_reason or "Cambios aplicados."
+        self._pending_apply_reason = None
+        if self._is_applying:
+            return
+        self._is_applying = True
+        try:
+            self._remember_ui_state()
+            try:
+                self._save_state(silent=True)
+            except Exception as exc:
+                self._show_error(f"No se pudo guardar el estado local: {exc}")
+                return
+
+            if any(entry.allow_other for entry in self.app_state.entries):
+                try:
+                    self.usecases.enable_user_allow_other(self.usecases.paths.FUSE_CONF)
+                    self._append_output("Opción user_allow_other habilitada en fuse.conf.", level="info")
+                except PermissionError as exc:
+                    self._append_output(f"No se pudo habilitar user_allow_other automáticamente: {exc}", level="warning")
+                except Exception as exc:
+                    self._append_output(f"Error actualizando fuse.conf: {exc}", level="warning")
+
+            try:
+                master_body, map_body = self.usecases.build_files(
+                    self._entries_dicts(),
+                    self.app_state.master_options.timeout,
+                    self.app_state.master_options.ghost,
+                )
+                result = self.usecases.write_config(master_body, map_body, as_root=is_root())
+            except Exception as exc:
+                self._show_error(f"No se pudo escribir la configuración: {exc}")
+                return
+
+            message = result.get("message", "Operación completada.")
+            temporary = result.get("temporary")
+            level = "warning" if temporary else "success"
+            self._append_output(message, level=level)
+            if temporary:
+                self._status("Configuración guardada temporalmente. Sigue las instrucciones mostradas.", 8000)
+            else:
+                self._status(f"{reason} Configuración aplicada.", 6000)
+                if self._restart_service_silent():
+                    self._verify_mounts()
+            self._mark_dirty(False)
+        finally:
+            self._is_applying = False
+
+    def _restart_service_silent(self) -> bool:
+        try:
+            rc, out, err = self.usecases.service("restart")
+        except Exception as exc:
+            self._append_output(f"No se pudo reiniciar autofs: {exc}", level="warning")
+            self._status("No se pudo reiniciar autofs.", 6000)
+            return False
+
+        if rc == 0:
+            self._append_output("Servicio autofs reiniciado correctamente.", level="success")
+            self._status("Servicio autofs reiniciado.", 4000)
+            self._check_service_status()
+            return True
+        else:
+            detail = self._short_text(err or out or "Sin detalles disponibles.")
+            self._append_output(f"No se pudo reiniciar autofs (código {rc}). Detalle: {detail}", level="warning")
+            self._status("No se pudo reiniciar autofs.", 6000)
+            self._check_service_status()
+            return False
+
+    def _verify_mounts(self) -> None:
+        if not self.app_state.entries:
+            return
+        for entry in self.app_state.entries:
+            path = entry.mount_point
+            path_q = shlex_quote(path)
+            ls_cmd = f"ls -la {path_q}"
+            try:
+                rc, out, err = self.usecases.test_ls(path)
+            except Exception as exc:
+                self._append_output(f"Verificación fallida para {path}. Comando: {ls_cmd}. Detalle: {exc}", level="warning")
+                self._status(f"Montaje no verificado en {path}. Revisa el registro.", 8000)
+                continue
+            if rc == 0:
+                listing = self._short_text(out or "Contenido listado correctamente.", limit=400)
+                self._append_output(f"Montaje verificado: {ls_cmd}\n{listing}", level="success")
+            else:
+                detail = self._short_text(err or out or "Sin detalles disponibles.")
+                self._append_output(
+                    f"El montaje no respondió correctamente. Comando: {ls_cmd}. Código: {rc}. Detalle: {detail}",
+                    level="warning",
+                )
+                self._status(f"Montaje no verificado en {path}. Revisa el registro.", 8000)
+                try:
+                    t_rc, t_out, t_err = self.usecases.trigger_mount(path)
+                    detail_trigger = self._short_text(t_out or t_err or "", limit=400)
+                    level = "info" if t_rc == 0 else "warning"
+                    self._append_output(
+                        f"Intento adicional con sudo (ls) para {path} retornó código {t_rc}. Detalle: {detail_trigger}",
+                        level=level,
+                    )
+                except Exception as exc:
+                    self._append_output(f"Fallo al intentar montar {path} con sudo: {exc}", level="warning")
+            mount_cmd = f"mountpoint {path_q}"
+            try:
+                m_rc, m_out, m_err = self.usecases.check_mount(path)
+            except Exception as exc:
+                self._append_output(f"No se pudo comprobar el montaje. Comando: {mount_cmd}. Detalle: {exc}", level="warning")
+                self._status(f"No se pudo comprobar el montaje en {path}.", 8000)
+                continue
+            if m_rc == 0:
+                detail = self._short_text(m_out or "La ruta es un punto de montaje activo.")
+                self._append_output(f"Montaje activo: {mount_cmd}\n{detail}", level="success")
+            else:
+                detail = self._short_text(m_err or m_out or "Sin detalles disponibles.")
+                self._append_output(
+                    f"El punto de montaje no aparece como montado. Comando: {mount_cmd}. Código: {m_rc}. Detalle: {detail}",
+                    level="warning",
+                )
+                self._status(f"Montaje no detectado en {path}. Revisa el registro.", 8000)
+                try:
+                    l_rc, l_out, l_err = self.usecases.collect_autofs_log()
+                except Exception as exc:
+                    self._append_output(f"No se pudieron obtener logs de autofs: {exc}", level="warning")
+                else:
+                    if l_rc == 0:
+                        snippet = self._short_text(l_out or "(sin salida)", limit=1200)
+                        self._append_output("Fragmento del journal de autofs:\n" + snippet, level="info")
+                    else:
+                        self._append_output(
+                            f"No se pudo leer el journal de autofs (código {l_rc}). Detalle: {l_err or l_out}",
+                            level="warning",
+                        )
+
+    def _status(self, message: str, timeout: int = 5000) -> None:
+        self.statusBar().showMessage(message, timeout)
 
     def _set_output(self, text: str) -> None:
         self.output_text.setPlainText(text.strip() if text else "")
@@ -723,8 +822,24 @@ class EntryDialog(QDialog):
         mount_layout.addWidget(self.mount_browse)
         form.addRow("Punto de montaje", mount_container)
 
-        self.host_edit = QLineEdit(entry.host if entry else "")
-        form.addRow("Host", self.host_edit)
+        self.host_candidates: List[HostCandidate] = []
+        self.host_combo = QComboBox()
+        self.host_combo.setEditable(True)
+        self.host_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.host_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.host_combo.lineEdit().setPlaceholderText("Ej.: servidor.local")
+        if entry and entry.host:
+            self.host_combo.setEditText(entry.host)
+        host_container = QWidget()
+        host_layout = QHBoxLayout(host_container)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.setSpacing(6)
+        host_layout.addWidget(self.host_combo, stretch=1)
+        self.btn_hosts_refresh = QPushButton("Buscar")
+        self.btn_hosts_refresh.setToolTip("Buscar hosts disponibles en la red (mDNS, Tailscale, etc.).")
+        self.btn_hosts_refresh.clicked.connect(lambda: self._load_hosts_async(force=True))
+        host_layout.addWidget(self.btn_hosts_refresh)
+        form.addRow("Host", host_container)
 
         self.remote_edit = QLineEdit(entry.remote_path if entry else "")
         form.addRow("Ruta remota", self.remote_edit)
@@ -735,8 +850,18 @@ class EntryDialog(QDialog):
         self.fstype_edit = QLineEdit(entry.fstype if entry else "fuse.sshfs")
         form.addRow("FSType", self.fstype_edit)
 
-        self.identity_edit = QLineEdit(entry.identity_file if entry else "")
-        form.addRow("Identity file", self.identity_edit)
+        identity_default = entry.identity_file if entry and entry.identity_file else self._default_identity_path()
+        self.identity_edit = QLineEdit(identity_default)
+        identity_container = QWidget()
+        identity_layout = QHBoxLayout(identity_container)
+        identity_layout.setContentsMargins(0, 0, 0, 0)
+        identity_layout.setSpacing(6)
+        identity_layout.addWidget(self.identity_edit, stretch=1)
+        self.identity_browse = QPushButton("Elegir…")
+        self.identity_browse.setToolTip("Selecciona el archivo de identidad SSH a utilizar.")
+        self.identity_browse.clicked.connect(self._select_identity_file)
+        identity_layout.addWidget(self.identity_browse)
+        form.addRow("Identity file", identity_container)
 
         self.allow_other_chk = QCheckBox("allow_other")
         self.allow_other_chk.setChecked(entry.allow_other if entry else True)
@@ -783,16 +908,102 @@ class EntryDialog(QDialog):
         layout.addWidget(buttons)
 
         self.resize(460, 0)
+        self._host_loader: Optional[threading.Thread] = None
+        self._load_hosts_async(initial=True)
 
     def _select_mount_point(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Seleccionar punto de montaje")
         if path:
             self.mount_edit.setText(path)
 
+    def _current_host_text(self) -> str:
+        text = self.host_combo.currentText().strip()
+        idx = self.host_combo.currentIndex()
+        if idx >= 0:
+            data = self.host_combo.itemData(idx)
+            if isinstance(data, str) and data.strip():
+                text = data.strip()
+        return text
+
+    def _load_hosts_async(self, initial: bool = False, force: bool = False) -> None:
+        if hasattr(self, "_host_loader") and self._host_loader and self._host_loader.is_alive():
+            return
+        current = self._current_host_text()
+        if current:
+            self.host_combo.setEditText(current)
+        self.btn_hosts_refresh.setEnabled(False)
+        if initial:
+            self.host_combo.lineEdit().setPlaceholderText("Buscando hosts…")
+
+        def worker():
+            try:
+                hosts = discover_hosts(force=force)
+                error = ""
+            except Exception as exc:
+                hosts = []
+                error = str(exc)
+            QTimer.singleShot(0, lambda: self._apply_host_candidates(hosts, error))
+
+        thread = threading.Thread(target=worker, daemon=True)
+        self._host_loader = thread
+        thread.start()
+
+    def _apply_host_candidates(self, hosts: List[HostCandidate], error: str) -> None:
+        self.host_candidates = hosts
+        current = self._current_host_text()
+        self.host_combo.blockSignals(True)
+        self.host_combo.clear()
+        seen = set()
+        for cand in hosts:
+            key = cand.name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            label = cand.name
+            if cand.address:
+                label += f" ({cand.address})"
+            label += f" [{cand.source}]"
+            self.host_combo.addItem(label, cand.name)
+
+        if current:
+            self.host_combo.setEditText(current)
+        elif hosts:
+            self.host_combo.setCurrentIndex(0)
+            self.host_combo.setEditText(hosts[0].name)
+        else:
+            self.host_combo.setEditText(current)
+        self.host_combo.blockSignals(False)
+        self.host_combo.lineEdit().setPlaceholderText("Ej.: servidor.local")
+        self.btn_hosts_refresh.setEnabled(True)
+
+        parent = self.parent()
+        if error:
+            if parent and hasattr(parent, "_append_output"):
+                parent._append_output(f"No se pudo descubrir hosts: {error}", level="warning")
+        elif hosts and parent and hasattr(parent, "_append_output"):
+            preview = ", ".join(c.name for c in hosts[:8])
+            if len(hosts) > 8:
+                preview += ", …"
+            parent._append_output(f"Hosts detectados ({len(hosts)}): {preview}", level="info")
+
+    def _default_identity_path(self) -> str:
+        root_key = "/root/.ssh/id_ed25519"
+        if os.path.exists(root_key):
+            return root_key
+        user_key = os.path.expanduser("~/.ssh/id_ed25519")
+        if os.path.exists(user_key):
+            return user_key
+        return ""
+
+    def _select_identity_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Seleccionar archivo de identidad", os.path.expanduser("~"))
+        if path:
+            self.identity_edit.setText(path)
+
     def accept(self) -> None:
         data = {
             "mount_point": self.mount_edit.text().strip(),
-            "host": self.host_edit.text().strip(),
+            "host": self._current_host_text(),
             "remote_path": self.remote_edit.text().strip(),
             "user": self.user_edit.text().strip(),
             "fstype": self.fstype_edit.text().strip() or "fuse.sshfs",
