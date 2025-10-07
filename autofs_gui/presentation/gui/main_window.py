@@ -180,17 +180,22 @@ class MainWindow(QMainWindow):
         detail_actions = QHBoxLayout()
         detail_actions.addStretch()
         self.btn_copy_detail = QPushButton("Copiar detalle")
-        self.btn_copy_detail.setToolTip("Copia el detalle JSON de la entrada seleccionada al portapapeles.")
+        self.btn_copy_detail.setToolTip("Copia el detalle de la entrada en formato JSON al portapapeles.")
         self.btn_copy_detail.clicked.connect(self._copy_entry_detail)
         detail_actions.addWidget(self.btn_copy_detail)
         detail_layout.addLayout(detail_actions)
-        self.entry_detail = QPlainTextEdit(detail_box)
-        self.entry_detail.setReadOnly(True)
-        self.entry_detail.setMinimumHeight(120)
-        detail_layout.addWidget(self.entry_detail)
+        self.entry_detail_table = QTableWidget(detail_box)
+        self.entry_detail_table.setColumnCount(2)
+        self.entry_detail_table.setHorizontalHeaderLabels(["Campo", "Valor"])
+        self.entry_detail_table.horizontalHeader().setStretchLastSection(True)
+        self.entry_detail_table.verticalHeader().setVisible(False)
+        self.entry_detail_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.entry_detail_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        detail_layout.addWidget(self.entry_detail_table)
         left_col.addWidget(detail_box)
 
         logs_box = QGroupBox("Registros", central)
+        logs_box.setVisible(False)
         logs_layout = QVBoxLayout(logs_box)
         logs_layout.setContentsMargins(10, 8, 10, 8)
         logs_layout.setSpacing(4)
@@ -207,6 +212,17 @@ class MainWindow(QMainWindow):
         self.output_text.setPlaceholderText("Aquí se mostrarán las operaciones ejecutadas y resultados.")
         logs_layout.addWidget(self.output_text)
         main_layout.addWidget(logs_box)
+
+        self.logs_box = logs_box
+        toggle_row = QHBoxLayout()
+        self.btn_toggle_logs = QPushButton("Mostrar registros")
+        self.btn_toggle_logs.setCheckable(True)
+        self.btn_toggle_logs.setChecked(False)
+        self.btn_toggle_logs.toggled.connect(self._toggle_logs)
+        self.btn_toggle_logs.setToolTip("Mostrar u ocultar el panel de registros.")
+        toggle_row.addWidget(self.btn_toggle_logs)
+        toggle_row.addStretch()
+        main_layout.addLayout(toggle_row)
 
         self.setCentralWidget(central)
         self.statusBar().showMessage("Listo.")
@@ -226,7 +242,7 @@ class MainWindow(QMainWindow):
     def _warm_host_cache(self) -> None:
         def worker():
             try:
-                discover_hosts(force=False)
+                discover_hosts(force=True)
                 QTimer.singleShot(0, lambda: None)  # trigger UI loop
             except Exception as exc:
                 QTimer.singleShot(0, lambda e=exc: self._append_output(
@@ -276,6 +292,12 @@ class MainWindow(QMainWindow):
         if not selected:
             return None
         return selected[0].row()
+
+    def _current_entry_json(self) -> Optional[dict]:
+        idx = self._current_entry_index()
+        if idx is None or idx >= len(self.app_state.entries):
+            return None
+        return self.app_state.entries[idx].to_dict()
 
     def _entries_dicts(self) -> List[dict]:
         prepared = []
@@ -371,12 +393,42 @@ class MainWindow(QMainWindow):
 
     def _update_entry_detail(self) -> None:
         idx = self._current_entry_index()
-        if idx is None:
-            self.entry_detail.clear()
+        data = self._current_entry_json() if idx is not None else None
+        self.entry_detail_table.setRowCount(0)
+        if not data:
             return
-        entry = self.app_state.entries[idx]
-        detail = json.dumps(entry.to_dict(), indent=2, ensure_ascii=False)
-        self.entry_detail.setPlainText(detail)
+
+        translations = {
+            "mount_point": "Punto de montaje",
+            "host": "Host",
+            "remote_path": "Ruta remota",
+            "user": "Usuario",
+            "fstype": "Tipo de sistema de archivos",
+            "identity_file": "Archivo de identidad",
+            "allow_other": "Permitir otros usuarios",
+            "uid": "UID",
+            "gid": "GID",
+            "umask": "Umask",
+            "server_alive_interval": "Intervalo keepalive",
+            "server_alive_count": "Reintentos keepalive",
+            "reconnect": "Reconectar",
+            "delay_connect": "Conexión diferida",
+            "extra_options": "Opciones adicionales",
+        }
+
+        rows = []
+        for key, value in data.items():
+            label = translations.get(key, key)
+            if isinstance(value, bool):
+                value_str = "Sí" if value else "No"
+            else:
+                value_str = str(value)
+            rows.append((label, value_str))
+
+        self.entry_detail_table.setRowCount(len(rows))
+        for row, (label, value) in enumerate(rows):
+            self.entry_detail_table.setItem(row, 0, QTableWidgetItem(label))
+            self.entry_detail_table.setItem(row, 1, QTableWidgetItem(value))
 
     def _prompt_sudo_password(self) -> Optional[str]:
         pwd, ok = QInputDialog.getText(
@@ -588,11 +640,16 @@ class MainWindow(QMainWindow):
             if sb:
                 sb.setValue(sb.maximum())
 
+    def _toggle_logs(self, checked: bool) -> None:
+        self.logs_box.setVisible(checked)
+        self.btn_toggle_logs.setText("Ocultar registros" if checked else "Mostrar registros")
+
     def _copy_entry_detail(self) -> None:
-        text = self.entry_detail.toPlainText().strip()
-        if not text:
+        data = self._current_entry_json()
+        if not data:
             self._status("No hay detalle para copiar.", 4000)
             return
+        text = json.dumps(data, indent=2, ensure_ascii=False)
         QApplication.clipboard().setText(text)
         self._status("Detalle copiado al portapapeles.", 4000)
 
@@ -909,7 +966,7 @@ class EntryDialog(QDialog):
 
         self.resize(460, 0)
         self._host_loader: Optional[threading.Thread] = None
-        self._load_hosts_async(initial=True)
+        self._load_hosts_async(initial=True, force=True)
 
     def _select_mount_point(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Seleccionar punto de montaje")
@@ -934,6 +991,13 @@ class EntryDialog(QDialog):
         self.btn_hosts_refresh.setEnabled(False)
         if initial:
             self.host_combo.lineEdit().setPlaceholderText("Buscando hosts…")
+
+        try:
+            cached_hosts = discover_hosts(force=False)
+        except Exception:
+            cached_hosts = []
+        if cached_hosts:
+            self._apply_host_candidates(cached_hosts, "")
 
         def worker():
             try:

@@ -197,7 +197,7 @@ def discover_hosts(force: bool = False) -> List[HostCandidate]:
                 seen.add(key)
                 results.append(cand)
 
-    results.sort(key=lambda c: (c.source, c.name))
+    results.sort(key=lambda c: (0 if c.source.lower() == "tailscale" else 1, c.source, c.name))
     with _CACHE_LOCK:
         _CACHE = results
         _CACHE_TS = time.time()
